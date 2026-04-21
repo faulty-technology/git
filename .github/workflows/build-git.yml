@@ -1,0 +1,402 @@
+name: Build git
+
+on:
+  schedule:
+    - cron: '17 6 * * 1'
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Override version, e.g. 2.54.0 (empty = detect latest upstream stable)"
+        required: false
+        type: string
+      force:
+        description: "Rebuild even if a release for this version already exists"
+        required: false
+        type: boolean
+        default: false
+
+permissions:
+  contents: write
+  id-token: write
+  attestations: write
+
+jobs:
+  detect:
+    runs-on: ubuntu-24.04
+    outputs:
+      version: ${{ steps.pick.outputs.version }}
+      should_build: ${{ steps.pick.outputs.should_build }}
+    steps:
+      - name: Determine version
+        id: pick
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          INPUT_VERSION: ${{ inputs.version }}
+          INPUT_FORCE: ${{ inputs.force }}
+        run: |
+          set -euo pipefail
+          if [ -n "${INPUT_VERSION:-}" ]; then
+            VERSION="$INPUT_VERSION"
+          else
+            VERSION=$(git ls-remote --tags --refs https://github.com/git/git 'v*' \
+                        | awk '{print $2}' | sed 's|refs/tags/v||' \
+                        | grep -vE '\-rc' \
+                        | sort -V | tail -1)
+          fi
+          [ -n "$VERSION" ] || { echo "::error::Could not determine version"; exit 1; }
+          echo "Upstream latest stable: $VERSION"
+
+          SHOULD_BUILD=true
+          if gh release view "v$VERSION" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            if [ "${INPUT_FORCE:-false}" = "true" ]; then
+              echo "Release v$VERSION exists but force=true; deleting for rebuild."
+              gh release delete "v$VERSION" --repo "$GITHUB_REPOSITORY" --yes --cleanup-tag
+            else
+              echo "Release v$VERSION already exists; skipping."
+              SHOULD_BUILD=false
+            fi
+          fi
+          {
+            echo "version=$VERSION"
+            echo "should_build=$SHOULD_BUILD"
+          } >> "$GITHUB_OUTPUT"
+
+  build:
+    needs: detect
+    if: needs.detect.outputs.should_build == 'true'
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - leg: linux-x86_64
+            runner: ubuntu-24.04
+          - leg: linux-arm64
+            runner: ubuntu-24.04-arm
+          - leg: macos-arm64
+            runner: macos-latest
+    runs-on: ${{ matrix.runner }}
+    env:
+      VERSION: ${{ needs.detect.outputs.version }}
+      LEG: ${{ matrix.leg }}
+      JUNIO_FINGERPRINT: "96E07AF25771955980DAD10020D04E5A713660A7"
+      TZ: UTC
+      LC_ALL: C
+    steps:
+      - name: Install build deps (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential autoconf gettext \
+            libcurl4-openssl-dev libexpat1-dev libssl-dev libz-dev libpcre2-dev \
+            xz-utils ca-certificates gnupg patchelf file
+
+      - name: Install build deps (macOS)
+        if: runner.os == 'macOS'
+        run: |
+          brew install autoconf gettext pcre2 xz gnupg gnu-tar
+          # gettext is keg-only on Homebrew; msgfmt must be on PATH during `make install`.
+          echo "$(brew --prefix gettext)/bin" >> "$GITHUB_PATH"
+
+      - name: Download + GPG-verify upstream tarball
+        run: |
+          set -euo pipefail
+          curl -fsSLR -o "git-${VERSION}.tar.xz" \
+            "https://mirrors.edge.kernel.org/pub/software/scm/git/git-${VERSION}.tar.xz"
+          curl -fsSLR -o "git-${VERSION}.tar.sign" \
+            "https://mirrors.edge.kernel.org/pub/software/scm/git/git-${VERSION}.tar.sign"
+
+          curl -fsSL -o junio.asc \
+            "https://git.kernel.org/pub/scm/docs/kernel/pgpkeys.git/plain/keys/20D04E5A713660A7.asc"
+
+          got=$(gpg --show-keys --with-colons junio.asc | awk -F: '/^fpr:/ {print $10; exit}')
+          if [ "$got" != "$JUNIO_FINGERPRINT" ]; then
+            echo "::error::Maintainer key fingerprint mismatch. Got='$got' Pinned='$JUNIO_FINGERPRINT'. See SIGNING.md for rotation procedure."
+            exit 1
+          fi
+          echo "Maintainer key fingerprint OK: $got"
+
+          GNUPGHOME="$(mktemp -d)"
+          export GNUPGHOME
+          chmod 700 "$GNUPGHOME"
+          gpg --batch --import junio.asc
+
+          xz -d "git-${VERSION}.tar.xz"
+          gpg --batch --verify "git-${VERSION}.tar.sign" "git-${VERSION}.tar"
+
+      - name: Extract + build reproducibly
+        run: |
+          set -euo pipefail
+          tar -xf "git-${VERSION}.tar"
+
+          if stat --version >/dev/null 2>&1; then
+            SDE=$(stat -c %Y "git-${VERSION}.tar")
+          else
+            SDE=$(stat -f %m "git-${VERSION}.tar")
+          fi
+          echo "SOURCE_DATE_EPOCH=$SDE" >> "$GITHUB_ENV"
+          export SOURCE_DATE_EPOCH="$SDE"
+
+          cd "git-${VERSION}"
+          JOBS=$(nproc 2>/dev/null || sysctl -n hw.ncpu)
+          MAKE_VARS=(
+            prefix=/
+            gitexecdir=libexec/git-core
+            template_dir=share/git-core/templates
+            sysconfdir=etc
+            htmldir=share/doc/git/html
+            mandir=share/man
+            localedir=share/locale
+            infodir=share/info
+            RUNTIME_PREFIX=YesPlease
+            NO_TCLTK=YesPlease
+            NO_INSTALL_HARDLINKS=YesPlease
+            USE_LIBPCRE2=YesPlease
+          )
+          if [ "$RUNNER_OS" = "macOS" ]; then
+            # Homebrew pcre2 and gettext are keg-only; point the compiler at them explicitly.
+            PCRE2_PREFIX="$(brew --prefix pcre2)"
+            GETTEXT_PREFIX="$(brew --prefix gettext)"
+            MAKE_VARS+=(
+              "CPPFLAGS=-I${PCRE2_PREFIX}/include -I${GETTEXT_PREFIX}/include"
+              "LDFLAGS=-L${PCRE2_PREFIX}/lib -L${GETTEXT_PREFIX}/lib"
+            )
+          fi
+          make -j"$JOBS" "${MAKE_VARS[@]}" all
+          make "${MAKE_VARS[@]}" install DESTDIR="$GITHUB_WORKSPACE/staging"
+
+      - name: Bundle runtime dependencies
+        run: |
+          set -euo pipefail
+          cd "$GITHUB_WORKSPACE/staging"
+          mkdir -p lib
+
+          if [ "$RUNNER_OS" = "Linux" ]; then
+            # Libs the host's glibc/kernel always provide — bundle everything else.
+            SYSTEM_RE='^(linux-vdso|libc|libm|libdl|libpthread|librt|libresolv|libnsl|libutil|ld-linux)\.'
+
+            # ldd reports the full transitive dep graph, so a single pass copies everything.
+            while IFS= read -r f; do
+              file -b "$f" | grep -q ELF || continue
+              ldd "$f" 2>/dev/null | awk '/=>/ {print $1"|"$3}' | while IFS='|' read -r soname path; do
+                [ -n "$path" ] && [ "$path" != "not" ] || continue
+                [[ "$soname" =~ $SYSTEM_RE ]] && continue
+                [ -e "lib/$soname" ] && continue
+                cp -L "$path" "lib/$soname"
+                chmod 0755 "lib/$soname"
+              done
+            done < <(find bin libexec -type f)
+
+            # Rewrite rpath on every ELF so bundled libs resolve from either bin/ or libexec/git-core/.
+            while IFS= read -r f; do
+              file -b "$f" | grep -q ELF || continue
+              patchelf --set-rpath '$ORIGIN/../lib:$ORIGIN/../../lib' "$f"
+            done < <(find bin libexec lib -type f)
+          fi
+
+          if [ "$RUNNER_OS" = "macOS" ]; then
+            is_system() {
+              case "$1" in /usr/lib/*|/System/*|@*) return 0 ;; *) return 1 ;; esac
+            }
+
+            copy_and_rewrite() {
+              local macho="$1" dep base
+              otool -L "$macho" | tail -n +2 | awk '{print $1}' | while read -r dep; do
+                [ -n "$dep" ] || continue
+                is_system "$dep" && continue
+                base=$(basename "$dep")
+                install_name_tool -change "$dep" "@rpath/$base" "$macho" 2>/dev/null || true
+                if [ ! -e "lib/$base" ]; then
+                  cp -L "$dep" "lib/$base"
+                  chmod 0755 "lib/$base"
+                  install_name_tool -id "@rpath/$base" "lib/$base" 2>/dev/null || true
+                fi
+              done
+            }
+
+            # otool only reports direct deps; iterate to a fixed point for transitive libs.
+            for _ in 1 2 3 4 5; do
+              before=$(find lib -maxdepth 1 -type f 2>/dev/null | wc -l)
+              while IFS= read -r f; do
+                file -b "$f" | grep -q 'Mach-O' || continue
+                copy_and_rewrite "$f"
+              done < <(find bin libexec lib -type f)
+              after=$(find lib -maxdepth 1 -type f 2>/dev/null | wc -l)
+              [ "$before" = "$after" ] && break
+            done
+
+            # Point every binary at our lib/ via an rpath entry.
+            while IFS= read -r f; do
+              file -b "$f" | grep -q 'Mach-O' || continue
+              case "$f" in
+                bin/*)                install_name_tool -add_rpath '@loader_path/../lib'    "$f" 2>/dev/null || true ;;
+                libexec/git-core/*)   install_name_tool -add_rpath '@loader_path/../../lib' "$f" 2>/dev/null || true ;;
+              esac
+            done < <(find bin libexec -type f)
+
+            # install_name_tool invalidates the ad-hoc signature ld adds on Apple Silicon; re-sign.
+            while IFS= read -r f; do
+              file -b "$f" | grep -q 'Mach-O' || continue
+              codesign --force --sign - "$f" 2>/dev/null || true
+            done < <(find bin libexec lib -type f)
+          fi
+
+          echo "--- staging/lib ---"
+          ls -la lib/
+
+      - name: Smoke test
+        run: |
+          set -euo pipefail
+          out=$("$GITHUB_WORKSPACE/staging/bin/git" --version)
+          echo "$out"
+          test "$out" = "git version ${VERSION}"
+
+      - name: Package reproducibly
+        id: package
+        run: |
+          set -euo pipefail
+          ARTIFACT="git-${VERSION}-${LEG}.tar.xz"
+          TAR=tar
+          if [ "$RUNNER_OS" = "macOS" ]; then TAR=gtar; fi
+          $TAR --sort=name --owner=0 --group=0 --numeric-owner \
+              --mtime="@${SOURCE_DATE_EPOCH}" \
+              -C staging -cf - . \
+            | XZ_OPT='-T1 -9' xz > "$ARTIFACT"
+          if command -v sha256sum >/dev/null 2>&1; then
+            sha256sum "$ARTIFACT" > "$ARTIFACT.sha256"
+          else
+            shasum -a 256 "$ARTIFACT" > "$ARTIFACT.sha256"
+          fi
+          cat "$ARTIFACT.sha256"
+          echo "artifact=$ARTIFACT" >> "$GITHUB_OUTPUT"
+
+      - name: Record runner metadata
+        run: |
+          {
+            echo "leg=${LEG}"
+            echo "runner_os=${RUNNER_OS}"
+            echo "image_os=${ImageOS:-unknown}"
+            echo "image_version=${ImageVersion:-unknown}"
+            echo "source_date_epoch=${SOURCE_DATE_EPOCH}"
+          } > "runner-${LEG}.meta"
+          cat "runner-${LEG}.meta"
+
+      - name: Attest build provenance
+        uses: actions/attest-build-provenance@v2
+        with:
+          subject-path: ${{ steps.package.outputs.artifact }}
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.leg }}
+          path: |
+            ${{ steps.package.outputs.artifact }}
+            ${{ steps.package.outputs.artifact }}.sha256
+            runner-${{ matrix.leg }}.meta
+          if-no-files-found: error
+
+  release:
+    needs: [detect, build]
+    if: needs.detect.outputs.should_build == 'true'
+    runs-on: ubuntu-24.04
+    env:
+      VERSION: ${{ needs.detect.outputs.version }}
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+    steps:
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: Assemble release directory
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          find artifacts -type f -name 'git-*.tar.xz' -exec cp {} dist/ \;
+          find artifacts -type f -name '*.sha256' -exec cat {} + > dist/SHA256SUMS
+          find artifacts -type f -name 'runner-*.meta' -exec cp {} dist/ \;
+          echo "--- dist ---"
+          ls -la dist
+          echo "--- SHA256SUMS ---"
+          cat dist/SHA256SUMS
+
+      - name: Write release notes
+        run: |
+          set -euo pipefail
+          cat > RELEASE_NOTES.md <<'EOF'
+          # git %VERSION%
+
+          Pre-built binaries of upstream [git %VERSION%](https://github.com/git/git/releases/tag/v%VERSION%) for:
+
+          - `linux-x86_64` — built on `ubuntu-24.04`
+          - `linux-arm64`  — built on `ubuntu-24.04-arm`
+          - `macos-arm64`  — built on `macos-latest` (Apple Silicon)
+
+          ## Install
+
+          ```
+          curl -LO https://github.com/%REPO%/releases/download/v%VERSION%/git-%VERSION%-<platform>.tar.xz
+          mkdir -p ~/.local
+          tar -C ~/.local -xJf git-%VERSION%-<platform>.tar.xz
+          export PATH="$HOME/.local/bin:$PATH"
+          git --version
+          ```
+
+          Built with `RUNTIME_PREFIX=YesPlease`, so `git` locates its libexec helpers, templates, and system config relative to the binary at runtime. The tarball is a flat `bin/`, `libexec/`, `lib/`, `share/`, `etc/` tree that merges into whichever directory you extract into. Third-party shared libraries (libcurl, libpcre2, and their transitive deps) are bundled in `lib/` and loaded via rpath, so no additional system packages are required on the target. Other common targets:
+
+          - System-wide: `sudo tar -C /usr/local -xJf git-%VERSION%-<platform>.tar.xz`
+          - Isolated: `sudo mkdir -p /opt/git && sudo tar -C /opt/git -xJf git-%VERSION%-<platform>.tar.xz`
+
+          On macOS, if Gatekeeper blocks the binary: `sudo xattr -dr com.apple.quarantine <install-root>`.
+
+          ## Verify
+
+          Every `.tar.xz` asset carries a SLSA v1 build-provenance attestation, keyless-signed via GitHub OIDC + Sigstore Fulcio and recorded in the Rekor transparency log.
+
+          ```
+          gh attestation verify git-%VERSION%-<platform>.tar.xz --repo %REPO%
+          ```
+
+          SHA-256 digests are in `SHA256SUMS`.
+
+          The upstream source tarball was GPG-verified during the build against Junio C Hamano's pinned key fingerprint
+          `96E0 7AF2 5771 9559 80DA D100 20D0 4E5A 7136 60A7` before anything was compiled. See [`SIGNING.md`](https://github.com/%REPO%/blob/main/SIGNING.md).
+
+          ## Reproduce
+
+          ```
+          VERSION=%VERSION%
+          curl -LOR https://mirrors.edge.kernel.org/pub/software/scm/git/git-${VERSION}.tar.xz
+          xz -d git-${VERSION}.tar.xz
+          export SOURCE_DATE_EPOCH=$(stat -c %Y git-${VERSION}.tar)
+          export TZ=UTC LC_ALL=C
+          tar -xf git-${VERSION}.tar && cd git-${VERSION}
+          MAKE_VARS="prefix=/ gitexecdir=libexec/git-core \
+            template_dir=share/git-core/templates sysconfdir=etc \
+            htmldir=share/doc/git/html mandir=share/man \
+            localedir=share/locale infodir=share/info \
+            RUNTIME_PREFIX=YesPlease NO_TCLTK=YesPlease \
+            NO_INSTALL_HARDLINKS=YesPlease USE_LIBPCRE2=YesPlease"
+          make -j"$(nproc)" $MAKE_VARS all
+          make $MAKE_VARS install DESTDIR="$PWD/staging"
+          tar --sort=name --owner=0 --group=0 --numeric-owner \
+              --mtime="@${SOURCE_DATE_EPOCH}" \
+              -C staging -cf - . \
+            | XZ_OPT='-T1 -9' xz > git-${VERSION}-<platform>.tar.xz
+          sha256sum git-${VERSION}-<platform>.tar.xz
+          ```
+
+          Run on the same GitHub runner image for byte-identical output — the exact image version per leg is recorded in the `runner-*.meta` files attached below. Reproducibility is best-effort on other distros.
+          EOF
+
+          sed -i "s|%VERSION%|${VERSION}|g; s|%REPO%|${GITHUB_REPOSITORY}|g" RELEASE_NOTES.md
+
+      - name: Create release
+        run: |
+          set -euo pipefail
+          gh release create "v${VERSION}" \
+            --repo "$GITHUB_REPOSITORY" \
+            --title "git ${VERSION}" \
+            --notes-file RELEASE_NOTES.md \
+            dist/*

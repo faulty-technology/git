@@ -1,0 +1,16 @@
+# Artifacts produced by a local build attempt.
+git-*.tar.xz
+git-*.tar.gz
+git-*.tar
+git-*.tar.sign
+git-*.sha256
+/staging/
+/dist/
+/artifacts/
+/git-[0-9]*/
+junio.asc
+RELEASE_NOTES.md
+runner-*.meta
+
+# GPG scratch
+.gnupg-tmp/
