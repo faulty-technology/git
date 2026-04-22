@@ -304,6 +304,9 @@ jobs:
       VERSION: ${{ needs.detect.outputs.version }}
       GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
     steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
       - name: Download all artifacts
         uses: actions/download-artifact@v4
         with:
@@ -335,10 +338,35 @@ jobs:
 
           ## Install
 
+          ### Linux x86_64
+
           ```
-          curl -LO https://github.com/%REPO%/releases/download/v%VERSION%/git-%VERSION%-<platform>.tar.xz
+          curl -LO https://github.com/%REPO%/releases/download/v%VERSION%/git-%VERSION%-linux-x86_64.tar.xz
+          command -v gh >/dev/null && gh attestation verify git-%VERSION%-linux-x86_64.tar.xz --repo %REPO%
           mkdir -p ~/.local
-          tar -C ~/.local -xJf git-%VERSION%-<platform>.tar.xz
+          tar -C ~/.local -xJf git-%VERSION%-linux-x86_64.tar.xz
+          export PATH="$HOME/.local/bin:$PATH"
+          git --version
+          ```
+
+          ### Linux ARM64
+
+          ```
+          curl -LO https://github.com/%REPO%/releases/download/v%VERSION%/git-%VERSION%-linux-arm64.tar.xz
+          command -v gh >/dev/null && gh attestation verify git-%VERSION%-linux-arm64.tar.xz --repo %REPO%
+          mkdir -p ~/.local
+          tar -C ~/.local -xJf git-%VERSION%-linux-arm64.tar.xz
+          export PATH="$HOME/.local/bin:$PATH"
+          git --version
+          ```
+
+          ### macOS ARM64 (Apple Silicon)
+
+          ```
+          curl -LO https://github.com/%REPO%/releases/download/v%VERSION%/git-%VERSION%-macos-arm64.tar.xz
+          command -v gh >/dev/null && gh attestation verify git-%VERSION%-macos-arm64.tar.xz --repo %REPO%
+          mkdir -p ~/.local
+          tar -C ~/.local -xJf git-%VERSION%-macos-arm64.tar.xz
           export PATH="$HOME/.local/bin:$PATH"
           git --version
           ```
@@ -400,3 +428,17 @@ jobs:
             --title "git ${VERSION}" \
             --notes-file RELEASE_NOTES.md \
             dist/*
+
+      - name: Update README version
+        run: |
+          set -euo pipefail
+          sed -i "s/^VERSION=.*/VERSION=${VERSION}/" README.md
+          if git diff --quiet README.md; then
+            echo "README already up to date."
+            exit 0
+          fi
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add README.md
+          git commit -m "docs: update install snippets to v${VERSION}"
+          git push
